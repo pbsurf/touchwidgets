@@ -1,4 +1,6 @@
-Some classes for improved handling of touch and tablet input in Qt5 Widgets applications
+Some classes for improved handling of touch and tablet input in Qt5 Widgets applications.  Includes support for WM_POINTER API introduced in Windows 8.
+
+MIT License
 
 Pull requests welcome
 

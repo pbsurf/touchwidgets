@@ -1,4 +1,5 @@
 #include "touchapplication.h"
+#include "touchinputfilter.h"
 
 #include <QWindow>
 #include <QWidget>
@@ -12,6 +13,10 @@ TouchApplication::TouchApplication(int& argc, char** argv) : QApplication(argc, 
   // prevent Qt from handling touch to mouse translation
   QCoreApplication::setAttribute(Qt::AA_SynthesizeMouseForUnhandledTouchEvents, false);
   acceptCount = 0;
+#ifdef Q_OS_WIN
+  // native event filter for handling WM_POINTER messages
+  installNativeEventFilter(new WinInputFilter);
+#endif
 }
 
 bool TouchApplication::sendMouseEvent(QObject* receiver, QEvent::Type mevtype, QPoint globalpos, Qt::KeyboardModifiers modifiers)
@@ -40,6 +45,21 @@ bool TouchApplication::sendMouseEvent(QObject* receiver, QEvent::Type mevtype, Q
   return true;
 }
 
+QObject* TouchApplication::getRecvWindow(QObject* candidate)
+{
+  if(candidate->isWindowType()) {
+    QWidget* popup = activePopupWidget();
+    if(!popup)
+      popup = activeModalWidget();
+    if(popup) {
+      QWindow* w = popup->windowHandle();
+      if(w)
+        return w;
+    }
+  }
+  return candidate;
+}
+
 // override QApplication::notify() for greatest control over event handling
 bool TouchApplication::notify(QObject* receiver, QEvent* event)
 {
@@ -54,6 +74,7 @@ bool TouchApplication::notify(QObject* receiver, QEvent* event)
   if((evtype == QEvent::TabletPress || evtype == QEvent::TouchBegin) && inputState == None) {
     if(receiver->isWindowType()) {
       int prevacceptcount = acceptCount;
+      receiver = getRecvWindow(receiver);
       QApplication::notify(receiver, event);
       if(acceptCount > prevacceptcount) {
         acceptCount = prevacceptcount;
@@ -61,6 +82,14 @@ bool TouchApplication::notify(QObject* receiver, QEvent* event)
         return true;
       }
       // else, fall through and resend as mouse event
+      // we must send a tablet release to put QWidgetWindow in consistent state
+      //  doesn't appear to be necessary for TouchBegin
+      if(evtype == QEvent::TabletPress) {
+        QTabletEvent* tev = static_cast<QTabletEvent*>(event);
+        QTabletEvent rlev(QEvent::TabletRelease, tev->posF(), tev->globalPosF(), tev->device(),
+                                 tev->pointerType(), 0, 0, 0, 0, 0, 0, tev->modifiers(), tev->uniqueId());
+        QApplication::notify(receiver, &rlev);
+      }
     }
     else {
       event->setAccepted(false);
@@ -86,6 +115,8 @@ bool TouchApplication::notify(QObject* receiver, QEvent* event)
   case QEvent::TabletMove:
   case QEvent::TabletPress:
   {
+    // TODO: should this only be done if inputState == TabletInput?
+    receiver = getRecvWindow(receiver);
     QTabletEvent* tabletevent = static_cast<QTabletEvent*>(event);
     QEvent::Type mevtype = QEvent::MouseMove;
     if(inputState == None && evtype == QEvent::TabletPress) {
@@ -110,6 +141,7 @@ bool TouchApplication::notify(QObject* receiver, QEvent* event)
   case QEvent::TouchUpdate:
   case QEvent::TouchBegin:
   {
+    receiver = getRecvWindow(receiver);
     QTouchEvent* touchevent = static_cast<QTouchEvent*>(event);
     QEvent::Type mevtype = QEvent::MouseMove;
     if(inputState == None && evtype == QEvent::TouchBegin

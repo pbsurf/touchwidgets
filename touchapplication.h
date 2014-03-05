@@ -15,6 +15,7 @@ public:
 
 private:
   bool sendMouseEvent(QObject* receiver, QEvent::Type mevtype, QPoint globalpos, Qt::KeyboardModifiers modifiers);
+  QObject* getRecvWindow(QObject* candidate);
 
   int activeTouchId;
   int acceptCount;
