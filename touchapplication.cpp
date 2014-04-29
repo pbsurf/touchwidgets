@@ -63,6 +63,7 @@ QObject* TouchApplication::getRecvWindow(QObject* candidate)
 // override QApplication::notify() for greatest control over event handling
 bool TouchApplication::notify(QObject* receiver, QEvent* event)
 {
+  //DebugEventFilter::printEvent(receiver, event);
   QEvent::Type evtype = event->type();
   // first, try to pass TabletPress/TouchBegin event and see if anyone accepts it
   // In Qt, events are first sent to a QWindow, which then figures out what widget they should be sent to.
@@ -176,7 +177,9 @@ bool TouchApplication::notify(QObject* receiver, QEvent* event)
   return QApplication::notify(receiver, event);
 }
 
-/* bool TouchApplication::winEventFilter(MSG* m, long* result) {
-  return ScribbleInput::winEventFilter(m, result);
-  // return QApplication::winEventFilter(m, result );
-} */
+#if defined(Q_OS_WIN) && !defined(QT_5)
+bool TouchApplication::winEventFilter(MSG* m, long* result)
+{
+  return WinInputFilter::winInputEvent(m, result);
+}
+#endif

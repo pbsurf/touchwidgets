@@ -4,11 +4,12 @@
 #include <QApplication>
 #include <QDesktopWidget>
 #include <QWindow>
+#include <QScreen>
 
 #ifdef Q_OS_WIN
 
-// Wintab support missing on Windows from Qt 5.0 until Qt 5.2
-#if QT_VERSION >= 0x050000 && QT_VERSION < 0x050200
+// Wintab support missing on Windows from Qt 5.0 until Qt 5.2 ... and is broken in Qt 5.2+
+#if QT_VERSION >= 0x050000 // && QT_VERSION < 0x050200
 #define USE_WINTAB 1
 #endif
 
@@ -44,8 +45,6 @@ static POINTER_PEN_INFO penPointerInfo[MAX_N_POINTERS];
 #define PACKETMODE 0
 #include "wintab/pktdef.h"
 
-static bool processWTPacket(MSG* m);
-
 static const int PACKET_BUFF_SIZE = 128;
 static PACKET localPacketBuf[PACKET_BUFF_SIZE];
 static HCTX hTab;
@@ -53,8 +52,9 @@ static HCTX hTab;
 static int minPressure, maxPressure;
 static int minX, maxX, minY, maxY;
 static DWORD btnPrev;
+static QRect desktopArea;
 
-static void WinInputFilter::initWinTab(HWND hWnd)
+static void initWinTab(HWND hWnd)
 {
   // attempt to load wintab
   if(!LoadWintab() || !gpWTInfoA || !gpWTInfoA(0, 0, NULL) || !gpWTPacketsGet)
@@ -86,8 +86,6 @@ static void WinInputFilter::initWinTab(HWND hWnd)
   gpWTQueueSizeSet(hTab, PACKET_BUFF_SIZE);
 }
 
-// WT_PACKET (and other input events) are only sent to the application's main message loop, and never appear
-//  in QWidget::winEvent(), so we must install filter on main message loop
 // Wintab references:
 //  http://www.wacomeng.com/windows/index.html (esp. "Documentation" link)
 //  Qt: http://qt.gitorious.org/qt/qt/blobs/raw/4.8/src/gui/kernel/qapplication_win.cpp  qwidget_win.cpp
@@ -108,80 +106,80 @@ static void WinInputFilter::initWinTab(HWND hWnd)
 //  indicator across devices.
 // If we want to use relative timing, compare touch pointer up time to WM_POINTERENTER time
 
-static bool processWTPacket(MSG* m)
+static bool processWTPacket(MSG* msg)
 {
-  bool qtignore = false;  // i don't think this will do any good since we'll have drained all the packets
-  int numPackets = gpWTPacketsGet((HCTX)(m->lParam), PACKET_BUFF_SIZE, &localPacketBuf);
+  // primary barrel button is 0x2 for single button pen, but 0x4 with default config of two button pen!
+  static DWORD tipBtn = 0x00000001;
+  int numPackets = gpWTPacketsGet((HCTX)(msg->lParam), PACKET_BUFF_SIZE, &localPacketBuf);
   for(int ii = 0; ii < numPackets; ii++) {
-    // let's keep this shitty button handling logic just to get started
     DWORD btnNew = localPacketBuf[ii].pkButtons;
-    // TODO: tip and erase are bit 0 in btnNew, barrel button is bit 1
-
-    QEvent::Type event = QEvent::TabletMove;
-    if((btnPrev && !currWidget) || (!btnPrev && !btnNew)) {
-      btnPrev = btnNew;
-      continue;
-    }
-    else if(btnNew && !btnPrev)
-      event = QEvent::TabletPress;
-    else if(!btnNew && btnPrev)
-      event = QEvent::TabletRelease;
+    QEvent::Type eventtype = QEvent::TabletMove;
+    if((btnNew & tipBtn) && !(btnPrev & tipBtn))
+      eventtype = QEvent::TabletPress;
+    else if(!(btnNew & tipBtn) && (btnPrev & tipBtn))
+      eventtype = QEvent::TabletRelease;
     btnPrev = btnNew;
 
-    // TODO: ptNew only used for debugging - remove later
     POINT ptNew;
     ptNew.x = localPacketBuf[ii].pkX;
     ptNew.y = localPacketBuf[ii].pkY;
-    // TODO: DON'T get geom for every single point!!!!
-    //QRect desktopArea = QApplication::desktop()->geometry();
-    QRect desktopArea = QApplication::primaryScreen()->virtualGeometry();
     // let's assume maxX, mayY are positive (Qt scaleCoords handles negative case too)
     qreal globalx = ((ptNew.x - minX) * desktopArea.width() / qreal(maxX - minX)) + desktopArea.left();
     qreal globaly = ((ptNew.y - minY) * desktopArea.height() / qreal(maxY - minY)) + desktopArea.top();
     qreal pressure = btnNew ? localPacketBuf[ii].pkNormalPressure / qreal(maxPressure - minPressure) : 0;
-
-    // from tabletUpdateCursor; supposedly this is supposed to be checked on WT_PROXIMITY
+    // supposedly this is supposed to be checked on WT_PROXIMITY
     QTabletEvent::PointerType ptrtype
         = (localPacketBuf[ii].pkCursor % 3 == 2) ? QTabletEvent::Eraser : QTabletEvent::Pen;
 
     int uniqueId = 1;
-    // TODO: figure out correct mask here for pen button
-    TouchEventFilter::instance()->notifyTabletEvent(
-        eventtype, QPointF(globalx, globaly), pressure, ptrtype, btnNew & 0, uniqueId);
+    TouchInputFilter::instance()->notifyTabletEvent(
+        eventtype, QPointF(globalx, globaly), pressure, ptrtype, btnNew & ~tipBtn, uniqueId);
   }
   return true;
 }
 
-static bool winTabEvent(MSG* m, long* result)
+// Right now, we are stealing Wintab events from Qt's implementation; really, we should use FindWindow and
+//  DestroyWindow to get rid of Qt's TabletDummyWindow and create our own invisible window and open our own
+//  tablet context to receive Wintab events
+
+static bool winTabEvent(MSG* msg, long* result)
 {
-  switch(m->message) {
-  // WinTab
-  case WM_ACTIVATE:
-    if(hTab) {
-      gpWTEnable(hTab, GET_WM_ACTIVATE_STATE(m->wParam, m->lParam));
-      if(GET_WM_ACTIVATE_STATE(m->wParam, m->lParam))
-        gpWTOverlap(hTab, TRUE);
-    }
-    break;
+  //if(!hTab)
+  //  return false;
+  switch(msg->message) {
+  /* case WM_ACTIVATE:
+    gpWTEnable(hTab, GET_WM_ACTIVATE_STATE(msg->wParam, msg->lParam));
+    if(GET_WM_ACTIVATE_STATE(msg->wParam, msg->lParam))
+      gpWTOverlap(hTab, TRUE);
+    break; */
   case WT_PROXIMITY:
-    if(hTab) {
+    // only handle proximity enter
+    if(LOWORD(msg->lParam) != 0) {
       LOGCONTEXTA lc;
       AXIS np;
-      // get the current context for its device variable
-      gpWTGetA(hTab, &lc);
+      // get the current context
+      gpWTGetA((HCTX)(msg->wParam), &lc);
+      // the following is only needed when stealing events from Qt wintab impl.
+      minX = 0;  //lc.lcOutOrgX;
+      maxX = lc.lcInExtX - lc.lcInOrgX;  //qAbs(lc.lcOutExtX);
+      minY = 0;  //lc.lcOutOrgY;
+      maxY = lc.lcInExtY - lc.lcInOrgY;  //qAbs(lc.lcOutExtY);
       // get the size of the pressure axis
       gpWTInfoA(WTI_DEVICES + lc.lcDevice, DVC_NPRESSURE, &np);
       minPressure = int(np.axMin);
       maxPressure = int(np.axMax);
+      desktopArea = QApplication::primaryScreen()->virtualGeometry();
+      btnPrev = 0;
+      //desktopArea = QApplication::desktop()->geometry();
+      // TODO: get uniqueID and other cursor info
     }
-    break;
+    return true;
   case WT_PACKET:
-    if(hTab)
-      return processWTPacket(m);
+    return processWTPacket(msg);
   default:
     break;
   } // switch
-  return false; // propagate to Qt
+  return false; // propagate to next handler
 }
 
 #endif // Wintab
@@ -192,7 +190,7 @@ static void processPenInfo(const POINTER_PEN_INFO& ppi, QEvent::Type eventtype)
       = (ppi.penFlags & PEN_FLAG_ERASER) ? QTabletEvent::Eraser : QTabletEvent::Pen;
 
   // unfortunately, there doesn't seem to be any reliable way to figure out himetric to pixel mapping,
-  //  so just calculate if from first point we see
+  //  so just calculate it from first point we see
   const POINT pix = ppi.pointerInfo.ptPixelLocation;
   const POINT him = ppi.pointerInfo.ptHimetricLocation;
   qreal x = him.x*HimetricToPix;
@@ -229,7 +227,7 @@ static void processPenHistory(UINT32 ptrid)
   }
 }
 
-static void processPointerFrame(UINT32 ptrid, Qt::TouchPointState eventtype)
+static bool processPointerFrame(UINT32 ptrid, Qt::TouchPointState eventtype)
 {
   UINT32 pointercount = MAX_N_POINTERS;
   if(GetPointerFrameInfo(ptrid, &pointercount, &pointerInfo[0])) {
@@ -244,8 +242,11 @@ static void processPointerFrame(UINT32 ptrid, Qt::TouchPointState eventtype)
       pt.setPressure(1);
       pts.append(pt);
     }
+    if(pts.empty())
+      return false;
     //event.t = pointerInfo[0].performanceCount;
     TouchInputFilter::instance()->notifyTouchEvent(eventtype, pts);
+    return true;
   }
 }
 
@@ -285,43 +286,44 @@ static bool winInputEvent(MSG* m, long* result)
         penPointerId = pointerInfo[0].pointerId;
         if(GetPointerPenInfo(penPointerId, &penPointerInfo[0]))
           processPenInfo(penPointerInfo[0], QEvent::TabletPress);
+        return true;
       }
       else
-        processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointPressed);
+        return processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointPressed);
     }
-    return true;
+    break;
   case WM_POINTERUPDATE:
-    //if(scribbling) {
-      if(penPointerId && penPointerId == GET_POINTERID_WPARAM(m->wParam))
-        processPenHistory(penPointerId);
-      else
-        processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointMoved);
+    if(penPointerId && penPointerId == GET_POINTERID_WPARAM(m->wParam)) {
+      processPenHistory(penPointerId);
       return true;
-    //}
+    }
+    else
+      return processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointMoved);
     break;
   case WM_POINTERUP:
     if(penPointerId && penPointerId == GET_POINTERID_WPARAM(m->wParam)) {
       if(GetPointerPenInfo(penPointerId, &penPointerInfo[0]))
         processPenInfo(penPointerInfo[0], QEvent::TabletRelease);
       penPointerId = NULL;
+      return true;
     }
     else
-      processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointReleased);
-    return true;
+      return processPointerFrame(GET_POINTERID_WPARAM(m->wParam), Qt::TouchPointReleased);
   default:
     break;
   }
   return false;
 }
 
-void initInput() //HWND hWnd)
+void initInput()
 {
   GetPointerInfo = NULL;
   initWMPointer();
   // Qt 4 supports tablet input
 #ifdef USE_WINTAB
   hTab = NULL;
-  initWinTab(hWnd);
+  //initWinTab();
+  LoadWintab();
 #endif
 }
 
@@ -332,7 +334,11 @@ WinInputFilter::WinInputFilter()
 
 bool WinInputFilter::nativeEventFilter(const QByteArray& eventType, void* message, long* result)
 {
-  return winInputEvent((MSG*)message,  result);
+  return
+#ifdef USE_WINTAB
+    winTabEvent((MSG*)message,  result) ||
+#endif
+    winInputEvent((MSG*)message,  result);
 }
 
 #endif // Q_OS_WIN
@@ -344,10 +350,16 @@ TouchInputFilter::TouchInputFilter() : tabletTarget(NULL), touchTarget(NULL)
 {
   touchApp = static_cast<TouchApplication*>(QApplication::instance());
   m_instance = this;
+  helperObject = new TouchHelperObject;
   // using a QTouchEvent with NULL touch device results in crash
   touchDevice.setName("WM_POINTER");
   touchDevice.setType(QTouchDevice::TouchScreen);
   touchDevice.setCapabilities(QTouchDevice::Position | QTouchDevice::Pressure);
+}
+
+TouchInputFilter::~TouchInputFilter()
+{
+  delete helperObject;
 }
 
 // functions for direct injection of tablet and touch events (only used on Windows at the moment)
@@ -355,18 +367,21 @@ TouchInputFilter::TouchInputFilter() : tabletTarget(NULL), touchTarget(NULL)
 void TouchInputFilter::notifyTabletEvent(QEvent::Type eventtype,
     const QPointF& globalpos, qreal pressure, QTabletEvent::PointerType ptrtype, int buttons, int deviceid)
 {
-  //QWindow* tabletTarget;
-  if(eventtype == QEvent::TabletPress || !tabletTarget)
+  if(eventtype == QEvent::TabletPress || !tabletTarget) {
     tabletTarget = QGuiApplication::topLevelAt(globalpos.toPoint());
-  if(!tabletTarget)
-    return;
+    if(!tabletTarget)
+      return;
+    QObject::connect(tabletTarget, SIGNAL(destroyed()), helperObject, SLOT(tabletWindowDestroyed()));
+  }
   QWindow* window = tabletTarget;
-  if(eventtype == QEvent::TabletRelease)
+  if(eventtype == QEvent::TabletRelease) {
+    QObject::disconnect(tabletTarget, SIGNAL(destroyed()), helperObject, SLOT(tabletWindowDestroyed()));
     tabletTarget = NULL;
+  }
 
   QPointF localpos = window->mapFromGlobal(globalpos.toPoint()) + (globalpos - globalpos.toPoint());
   QTabletEvent tabletevent(eventtype, localpos, globalpos, deviceid , ptrtype,
-                           pressure, 0, 0, 0, 0, 0, Qt::NoModifier, deviceid);
+                           pressure, 0, 0, 0, 0, 0, QApplication::keyboardModifiers(), deviceid);
   touchApp->setTabletButtons(buttons);
   touchApp->notify(window, &tabletevent);
 }
@@ -378,12 +393,15 @@ void TouchInputFilter::notifyTouchEvent(
   QEvent::Type evtype = QEvent::TouchUpdate;
   if(touchstate == Qt::TouchPointPressed && !touchTarget) {
     touchTarget = QGuiApplication::topLevelAt(points[0].screenPos().toPoint());
+    if(touchTarget)
+      QObject::connect(touchTarget, SIGNAL(destroyed()), helperObject, SLOT(touchWindowDestroyed()));
     evtype = QEvent::TouchBegin;
   }
   if(!touchTarget)
     return;
   QWindow* window = touchTarget;
   if(touchstate == Qt::TouchPointReleased && points.count() == 1) {
+    QObject::disconnect(touchTarget, SIGNAL(destroyed()), helperObject, SLOT(touchWindowDestroyed()));
     touchTarget = NULL;
     evtype = QEvent::TouchEnd;
   }
@@ -395,8 +413,18 @@ void TouchInputFilter::notifyTouchEvent(
     // TODO: handle last, start position stuff by saving previous list of touch points
   }
 
-  QTouchEvent touchevent(evtype, &touchDevice, Qt::NoModifier, touchstate, points);
+  QTouchEvent touchevent(evtype, &touchDevice, QApplication::keyboardModifiers(), touchstate, points);
   touchApp->notify(window, &touchevent);
+}
+
+void TouchHelperObject::tabletWindowDestroyed()
+{
+  TouchInputFilter::instance()->tabletTarget = NULL;
+}
+
+void TouchHelperObject::touchWindowDestroyed()
+{
+  TouchInputFilter::instance()->touchTarget = NULL;
 }
 
 
