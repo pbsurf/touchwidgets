@@ -248,6 +248,7 @@ static bool processPointerFrame(UINT32 ptrid, Qt::TouchPointState eventtype)
     TouchInputFilter::instance()->notifyTouchEvent(eventtype, pts);
     return true;
   }
+  return false;
 }
 
 static void initWMPointer()
